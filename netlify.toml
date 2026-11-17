@@ -1,0 +1,8 @@
+# Netlify: build the React app and publish the dist folder.
+# Set VITE_API_URL in Netlify > Site configuration > Environment variables.
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
