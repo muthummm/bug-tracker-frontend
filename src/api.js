@@ -16,7 +16,21 @@ const TOKEN_KEY = 'bugtracker.token';
 export const getToken = () => localStorage.getItem(TOKEN_KEY);
 export const setToken = t => (t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY));
 
-export async function api(path, { method = 'GET', body, form } = {}) {
+// Count of requests in flight, so the page can show a loading bar while the API is busy.
+let pending = 0;
+const listeners = new Set();
+export const subscribePending = fn => { listeners.add(fn); fn(pending); return () => listeners.delete(fn); };
+async function track(promise, silent) {
+  if (silent) return promise;
+  pending++; listeners.forEach(fn => fn(pending));
+  try { return await promise; } finally { pending--; listeners.forEach(fn => fn(pending)); }
+}
+
+// silent: true skips the loading bar (used for background refreshes)
+export function api(path, { method = 'GET', body, form, silent } = {}) {
+  return track(request(path, { method, body, form }), silent);
+}
+async function request(path, { method, body, form }) {
   const headers = {};
   const token = getToken();
   if (token) headers.Authorization = 'Bearer ' + token;
@@ -36,7 +50,7 @@ export async function api(path, { method = 'GET', body, form } = {}) {
   return data;
 }
 
-export async function importCsv(projectId, file) {
+export const importCsv = (projectId, file) => track((async () => {
   const text = await file.text();
   const res = await fetch(`${API_URL}/api/import?project=${projectId}`, {
     method: 'POST', body: text, headers: { Authorization: 'Bearer ' + getToken(), 'Content-Type': 'text/csv' },
@@ -44,9 +58,9 @@ export async function importCsv(projectId, file) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'Import failed.');
   return data;
-}
+})());
 
-export async function downloadCsv(project) {
+export const downloadCsv = project => track((async () => {
   const res = await fetch(`${API_URL}/api/export.csv?project=${project.id}`, { headers: { Authorization: 'Bearer ' + getToken() } })
     .catch(() => { throw new Error(OFFLINE); });
   if (!res.ok) throw new Error('Export failed.');
@@ -55,7 +69,7 @@ export async function downloadCsv(project) {
   const a = Object.assign(document.createElement('a'), { href: url, download: `${safe}-${new Date().toISOString().slice(0, 10)}.csv` });
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
+})());
 
 export const STATUS_VAR = {
   'Open': '--s-open', 'In Progress': '--s-prog', 'Fixed': '--s-fixed', 'Ready for Retest': '--s-retest',

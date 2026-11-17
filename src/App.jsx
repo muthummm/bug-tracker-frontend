@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   api, getToken, setToken, downloadCsv, importCsv, STATUSES, DEV_STATUSES, PRIORITIES, STATUS_VAR, PRIORITY_VAR, fmtDate, fmtTime, today,
-  isTester, fileUrl,
+  isTester, fileUrl, subscribePending,
 } from './api.js';
 
 const ROLE_INFO = {
@@ -18,6 +18,49 @@ const StatusPill = ({ status }) => (
 const Priority = ({ priority }) => (
   <span className={'pri' + (priority ? '' : ' unset')}><span className="bar" style={{ '--c': `var(${PRIORITY_VAR[priority] || '--line'})` }} />{priority || 'Not set'}</span>
 );
+
+// ---------- loading indicators ----------
+const Spinner = ({ size }) => <span className={'spinner' + (size ? ' ' + size : '')} aria-hidden="true" />;
+
+// A button that shows a spinner and "busyText" while its request is pending.
+function BusyBtn({ busy, busyText, disabled, children, className = 'btn', ...rest }) {
+  return (
+    <button className={className + (busy ? ' is-busy' : '')} disabled={busy || disabled} aria-busy={busy || undefined} {...rest}>
+      {busy && <Spinner />}{busy && busyText ? busyText : children}
+    </button>
+  );
+}
+
+function Loader({ text = 'Loading…', full }) {
+  return <div className={'loader' + (full ? ' full' : '')} role="status"><Spinner size="lg" /><span>{text}</span></div>;
+}
+
+// Thin bar across the top of the page while any API request is pending.
+// Waits 150 ms before showing so very fast requests don't flicker.
+function TopProgress() {
+  const [active, setActive] = useState(false);
+  useEffect(() => {
+    let t;
+    const unsub = subscribePending(n => {
+      clearTimeout(t);
+      if (n > 0) t = setTimeout(() => setActive(true), 150);
+      else setActive(false);
+    });
+    return () => { clearTimeout(t); unsub(); };
+  }, []);
+  return <div className={'top-progress' + (active ? ' on' : '')} role="progressbar" aria-hidden={!active} aria-label="Loading" />;
+}
+
+// The free backend host sleeps when idle; tell the user if the first request is slow.
+function useSlowHint(busy, ms = 5000) {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (!busy) { setSlow(false); return; }
+    const t = setTimeout(() => setSlow(true), ms);
+    return () => clearTimeout(t);
+  }, [busy, ms]);
+  return slow;
+}
 
 // toast('Saved') shows a green success message; toast(msg, 'error') a red one.
 function useToast() {
@@ -72,6 +115,7 @@ function AuthScreen({ onAuthed }) {
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const [showPw, setShowPw] = useState(false);
+  const slow = useSlowHint(busy);
   const set = k => e => setF({ ...f, [k]: e.target.value });
 
   async function submit(e) {
@@ -81,13 +125,12 @@ function AuthScreen({ onAuthed }) {
       const data = await api(`/auth/${mode}`, { method: 'POST', body: f });
       setToken(data.token);
       onAuthed(data.user, mode === 'register');
-    } catch (e2) { setErr(e2.message); }
-    setBusy(false);
+    } catch (e2) { setErr(e2.message); setBusy(false); }
   }
 
   return (
     <div className="auth">
-      <form className="auth-card" onSubmit={submit}>
+      <form className="auth-card" onSubmit={submit} aria-busy={busy || undefined}>
         <h1>Bug Log</h1>
         <p className="muted">{mode === 'login' ? 'Sign in to report and track bugs.' : 'Create an account for a tester or developer.'}</p>
         {mode === 'register' && (
@@ -114,8 +157,10 @@ function AuthScreen({ onAuthed }) {
           {mode === 'register' && <span className="hint">At least 6 characters</span>}
         </label>
         {err && <p className="err">{err}</p>}
-        <button className="btn primary" disabled={busy}>{mode === 'login' ? 'Sign in' : 'Create account'}</button>
-        <button type="button" className="link-btn" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setErr(''); }}>
+        <BusyBtn className="btn primary" busy={busy} busyText={mode === 'login' ? 'Signing in…' : 'Creating account…'}>
+          {mode === 'login' ? 'Sign in' : 'Create account'}</BusyBtn>
+        {slow && <p className="hint slow">The server is waking up. This can take up to a minute the first time.</p>}
+        <button type="button" className="link-btn" disabled={busy} onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setErr(''); }}>
           {mode === 'login' ? 'New here? Create an account' : 'Already have an account? Sign in'}
         </button>
       </form>
@@ -138,17 +183,17 @@ function BugForm({ bug, project, users, modules, panels, onSaved, onCancel, dirt
   const set = k => e => setF(prev => ({ ...prev, [k]: e.target.value }));
   if (dirtyRef) dirtyRef.current = Object.keys(EMPTY).some(k => String(f[k] ?? '') !== String(initial[k] ?? ''));
 
+  const [uploading, setUploading] = useState(false);
   async function uploadFile(file) {
     if (!file || !file.type.startsWith('image/')) return;
-    setBusy(true); setErr('Uploading screenshot…');
+    setUploading(true); setErr('');
     try {
       const form = new FormData();
       form.append('file', file);
       const { url } = await api('/upload', { method: 'POST', form });
       setF(prev => ({ ...prev, screenshot: url }));
-      setErr('');
     } catch (e) { setErr(e.message); }
-    setBusy(false);
+    setUploading(false);
   }
 
   async function submit(e) {
@@ -208,7 +253,9 @@ function BugForm({ bug, project, users, modules, panels, onSaved, onCancel, dirt
         <label className="f">Screenshot / link<input id="i-link" type="url" value={f.link} onChange={set('link')} placeholder="https://… (Drive, video, Jira, etc.)" /></label>
         <div className="f">
           <span>Screenshot image</span>
-          {f.screenshot
+          {uploading
+            ? <div className="drop uploading" role="status"><Spinner size="lg" /><span>Uploading screenshot…</span></div>
+            : f.screenshot
             ? <div className="thumb"><img src={fileUrl(f.screenshot)} alt="Screenshot" />
                 <button type="button" onClick={() => setF(prev => ({ ...prev, screenshot: '' }))}>Remove</button></div>
             : <label className={'drop' + (dragging ? ' over' : '')}
@@ -225,8 +272,8 @@ function BugForm({ bug, project, users, modules, panels, onSaved, onCancel, dirt
       <div className="dlg-foot">
         <span className="err">{err}</span>
         <span className="hint kbd-hint">Ctrl+Enter to save</span>
-        <button type="button" className="btn" onClick={onCancel}>Cancel</button>
-        <button className="btn primary" disabled={busy}>{bug ? 'Save changes' : 'Save bug'}</button>
+        <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
+        <BusyBtn className="btn primary" busy={busy} disabled={uploading} busyText="Saving…">{bug ? 'Save changes' : 'Save bug'}</BusyBtn>
       </div>
     </form>
   );
@@ -251,7 +298,7 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
   const [err, setErr] = useState('');
   const [status, setStatus] = useState('');
   const [comment, setComment] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(''); // which action is pending: 'status:<to>', 'comment', 'notes', 'delete'
   const [confirmDel, setConfirmDel] = useState(false);
   const [notes, setNotes] = useState(null); // null = not editing
   const tester = isTester(me);
@@ -264,9 +311,10 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
   }, [id]);
   useEffect(() => { load(); }, [load]);
 
-  async function updateStatus(target = status) {
+  async function updateStatus(target = status, which = 'status:' + target) {
+    if (busy) return;
     if (target === data.bug.status && !comment.trim()) { toast('Pick a different status or type a comment first.', 'error'); return; }
-    setBusy(true);
+    setBusy(which);
     try {
       const { bug } = await api(`/bugs/${id}/status`, { method: 'PATCH', body: { status: target, comment } });
       setComment('');
@@ -275,24 +323,25 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
         : `Comment added to ${bug.key}`);
       await load(); onChanged();
     } catch (e) { toast(e.message, 'error'); }
-    setBusy(false);
+    setBusy('');
   }
   async function saveNotes() {
-    setBusy(true);
+    setBusy('notes');
     try {
       await api(`/bugs/${id}/notes`, { method: 'PATCH', body: { notes } });
       setNotes(null); toast(`Notes saved on ${data.bug.key}`);
       await load(); onChanged();
     } catch (e) { toast(e.message, 'error'); }
-    setBusy(false);
+    setBusy('');
   }
   async function del() {
+    setBusy('delete');
     try { await api(`/bugs/${id}`, { method: 'DELETE' }); toast(`${data.bug.key} deleted successfully`); onChanged(); onClose(); }
-    catch (e) { toast(e.message, 'error'); }
+    catch (e) { toast(e.message, 'error'); setBusy(''); }
   }
 
   if (err) return <div className="dlg-body"><p className="err">{err}</p></div>;
-  if (!data) return <div className="dlg-body"><p className="muted">Loading…</p></div>;
+  if (!data) return <div className="dlg-body"><Loader text="Loading bug…" /></div>;
   const b = data.bug;
   const actions = (NEXT_STEPS[b.status] || []).filter(([, , who]) => who === (tester ? 'tester' : 'dev'));
   const Sec =({ title, children }) => (
@@ -308,14 +357,16 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
           <div className="sb-line"><strong>Next step</strong><StatusPill status={b.status} /></div>
           {actions.length > 0
             ? <div className="quick">{actions.map(([to, label], i) => (
-                <button key={to} className={'btn' + (i === 0 ? ' primary' : '')} disabled={busy} onClick={() => updateStatus(to)}>
-                  {label}<span className="to">→ {to}</span></button>))}</div>
+                <BusyBtn key={to} className={'btn' + (i === 0 ? ' primary' : '')} busy={busy === 'status:' + to} disabled={!!busy}
+                  busyText="Updating…" onClick={() => updateStatus(to)}>
+                  {label}<span className="to">→ {to}</span></BusyBtn>))}</div>
             : <p className="hint">{waitingText(b.status, tester)}</p>}
           <div className="sb-line grow">
             <input id="v-comment" value={comment} onChange={e => setComment(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && comment.trim()) updateStatus(b.status); }}
+              onKeyDown={e => { if (e.key === 'Enter' && comment.trim()) updateStatus(b.status, 'comment'); }}
               placeholder="Comment, e.g. fixed in build 1.4.2" aria-label="Comment" />
-            <button className="btn" disabled={busy || !comment.trim()} onClick={() => updateStatus(b.status)}>Add comment</button>
+            <BusyBtn className="btn" busy={busy === 'comment'} disabled={!!busy || !comment.trim()} busyText="Adding…"
+              onClick={() => updateStatus(b.status, 'comment')}>Add comment</BusyBtn>
           </div>
           {actions.length > 0 && <span className="hint">A typed comment is saved together with the next step you click.</span>}
           <div className="sb-line">
@@ -324,7 +375,8 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
               {STATUSES.filter(s => tester || DEV_STATUSES.includes(s) || s === b.status).map(s =>
                 <option key={s} disabled={!tester && !DEV_STATUSES.includes(s)}>{s}</option>)}
             </select>
-            <button className="btn primary" disabled={busy || status === b.status} onClick={() => updateStatus()}>Update status</button>
+            <BusyBtn className="btn primary" busy={busy === 'status-select'} disabled={!!busy || status === b.status} busyText="Updating…"
+              onClick={() => updateStatus(status, 'status-select')}>Update status</BusyBtn>
           </div>
           {!tester && <span className="hint">Closing or reopening is done by the tester after they retest your fix.</span>}
         </div>
@@ -353,8 +405,8 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
             ? <div className="notes-edit">
                 <textarea id="v-notes" rows={4} value={notes} onChange={e => setNotes(e.target.value)} autoFocus
                   placeholder="e.g. Root cause: null check missing in cart total. Fixed in build 1.4.2" aria-label="Notes" />
-                <div className="row-btns"><button className="btn primary" disabled={busy} onClick={saveNotes}>Save notes</button>
-                  <button className="btn" onClick={() => setNotes(null)}>Cancel</button></div>
+                <div className="row-btns"><BusyBtn className="btn primary" busy={busy === 'notes'} disabled={!!busy} busyText="Saving…" onClick={saveNotes}>Save notes</BusyBtn>
+                  <button className="btn" disabled={busy === 'notes'} onClick={() => setNotes(null)}>Cancel</button></div>
               </div>
             : b.notes ? <p>{b.notes}</p> : <p className="none">Not provided</p>}
         </div>
@@ -381,8 +433,8 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
         {confirmDel && (
           <div className="confirm">
             <span>Delete {b.key} for everyone? This can't be undone.</span>
-            <button className="btn danger" onClick={del}>Yes, delete</button>
-            <button className="btn" onClick={() => setConfirmDel(false)}>Keep</button>
+            <BusyBtn className="btn danger" busy={busy === 'delete'} busyText="Deleting…" onClick={del}>Yes, delete</BusyBtn>
+            <button className="btn" disabled={busy === 'delete'} onClick={() => setConfirmDel(false)}>Keep</button>
           </div>
         )}
       </div>
@@ -397,8 +449,11 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
   const [pick, setPick] = useState('');
   const [busy, setBusy] = useState(false);
   const [confirmId, setConfirmId] = useState(null);
+  const [loadingPeople, setLoadingPeople] = useState(tester);
 
-  useEffect(() => { if (tester) api('/users').then(setEveryone).catch(() => {}); }, [tester]);
+  useEffect(() => {
+    if (tester) api('/users').then(setEveryone).catch(() => {}).finally(() => setLoadingPeople(false));
+  }, [tester]);
   const memberIds = new Set(members.map(m => m.id));
   const candidates = everyone.filter(u => !memberIds.has(u.id));
 
@@ -430,14 +485,14 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
         <p className="hint">Only the people listed here can see this project and its bugs.{tester ? ' Add a developer to give them access.' : ''}</p>
         {tester && (
           <div className="team-add">
-            <select id="t-pick" value={pick} onChange={e => setPick(e.target.value)} aria-label="Person to add">
-              <option value="">{candidates.length ? 'Choose a person to add…' : 'Everyone with an account is already here'}</option>
+            <select id="t-pick" value={pick} onChange={e => setPick(e.target.value)} aria-label="Person to add" disabled={loadingPeople}>
+              <option value="">{loadingPeople ? 'Loading people…' : candidates.length ? 'Choose a person to add…' : 'Everyone with an account is already here'}</option>
               {['Developer', 'Tester'].map(role => {
                 const list = candidates.filter(u => u.role === role);
                 return list.length > 0 && <optgroup key={role} label={role + 's'}>{list.map(u => <option key={u.id} value={u.id}>{u.name} ({u.username})</option>)}</optgroup>;
               })}
             </select>
-            <button className="btn primary" disabled={!pick || busy} onClick={add}>Add to project</button>
+            <BusyBtn className="btn primary" busy={busy && !confirmId} disabled={!pick || busy} busyText="Adding…" onClick={add}>Add to project</BusyBtn>
           </div>
         )}
         {tester && <p className="hint">Not in the list? They need to create an account first (choose "Create an account" on the sign-in page).</p>}
@@ -447,8 +502,8 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
               <span className="t-who"><b>{m.name}</b>{m.id === me.id && <span className="you"> (you)</span>}
                 <small>{m.username} · {m.role}{m.pending ? ' · hasn’t set a password yet' : ''}{m.added_by_name ? ` · added by ${m.added_by_name}` : ''}</small></span>
               {tester && (confirmId === m.id
-                ? <span className="t-confirm">Remove? <button className="btn danger" disabled={busy} onClick={() => remove(m)}>Yes, remove</button>
-                    <button className="btn" onClick={() => setConfirmId(null)}>Keep</button></span>
+                ? <span className="t-confirm">Remove? <BusyBtn className="btn danger" busy={busy} busyText="Removing…" onClick={() => remove(m)}>Yes, remove</BusyBtn>
+                    <button className="btn" disabled={busy} onClick={() => setConfirmId(null)}>Keep</button></span>
                 : <button className="btn ghost danger" onClick={() => setConfirmId(m.id)}>Remove</button>)}
             </li>
           ))}
@@ -459,25 +514,32 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
 }
 
 // ---------- project picker ----------
-function ProjectsScreen({ me, onOpen, onLogout, toast }) {
+function ProjectsScreen({ me, onOpen, onLogout, signingOut, toast }) {
   const [projects, setProjects] = useState(null);
   const [err, setErr] = useState('');
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState('');
   const [desc, setDesc] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const slow = useSlowHint(projects === null && !err);
 
-  const load = useCallback(() => api('/projects').then(setProjects).catch(e => setErr(e.message)), []);
+  const load = useCallback(() => {
+    setRefreshing(true);
+    return api('/projects').then(p => { setProjects(p); setErr(''); }).catch(e => setErr(e.message)).finally(() => setRefreshing(false));
+  }, []);
   useEffect(() => { load(); }, [load]);
 
   async function create(e) {
     e.preventDefault();
-    setErr('');
+    setErr(''); setCreating(true);
     try {
       const { project } = await api('/projects', { method: 'POST', body: { name, description: desc } });
       toast(`Project "${project.name}" created successfully. Click it to open.`);
       setAdding(false); setName(''); setDesc('');
       load();
     } catch (e2) { setErr(e2.message); }
+    setCreating(false);
   }
 
   return (
@@ -485,7 +547,7 @@ function ProjectsScreen({ me, onOpen, onLogout, toast }) {
       <header className="top">
         <div className="wrap">
           <div className="brand"><h1>Bug Log</h1><span className="sub">{me.name} · {me.role}</span></div>
-          <button className="btn ghost signout" onClick={onLogout}>Sign out</button>
+          <BusyBtn className="btn ghost signout" busy={signingOut} busyText="Signing out…" onClick={onLogout}>Sign out</BusyBtn>
         </div>
       </header>
       <main className="wrap projects">
@@ -497,17 +559,24 @@ function ProjectsScreen({ me, onOpen, onLogout, toast }) {
           <form className="new-project" onSubmit={create}>
             <label className="f">Project name<input id="p-name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ROA - Mentorship Web" autoFocus /></label>
             <label className="f">Description<input id="p-desc" value={desc} onChange={e => setDesc(e.target.value)} placeholder="Optional" /></label>
-            <div className="row-btns"><button className="btn primary" disabled={!name.trim()}>Create</button>
-              <button type="button" className="btn" onClick={() => { setAdding(false); setErr(''); }}>Cancel</button></div>
+            <div className="row-btns"><BusyBtn className="btn primary" busy={creating} disabled={!name.trim()} busyText="Creating…">Create</BusyBtn>
+              <button type="button" className="btn" disabled={creating} onClick={() => { setAdding(false); setErr(''); }}>Cancel</button></div>
           </form>
         )}
         {err && <div className="notice">{err}</div>}
+        {projects === null && !err && (
+          <div className="project-grid" aria-busy="true">
+            {[0, 1, 2].map(i => <div key={i} className="project-card skeleton"><span /><span /><span /></div>)}
+            <span className="sr-only" role="status">Loading projects…</span>
+          </div>
+        )}
+        {slow && <p className="hint slow">The server is waking up. This can take up to a minute the first time.</p>}
         {projects && projects.length === 0 && !adding && (
           <div className="empty list">
             {isTester(me)
               ? <><h2>No projects yet</h2><p>Create a project, then add your developers to it from Team.</p></>
               : <><h2>You haven't been added to a project yet</h2><p>Ask your tester to add <b>{me.username}</b> to a project. It will show up here right after.</p>
-                  <button className="btn" onClick={load}>Check again</button></>}
+                  <BusyBtn className="btn" busy={refreshing} busyText="Checking…" onClick={load}>Check again</BusyBtn></>}
           </div>
         )}
         <div className="project-grid">
@@ -545,9 +614,12 @@ export default function App() {
   }, []);
   const [toastState, toast] = useToast();
   const openProject = id => { location.hash = id ? 'project-' + id : ''; setProjectId(id); };
+  const [signingOut, setSigningOut] = useState(false);
   const logout = async () => {
+    if (signingOut) return;
+    setSigningOut(true);
     await api('/auth/logout', { method: 'POST' }).catch(() => {});
-    setToken(null); setMe(null); toast('Signed out successfully');
+    setToken(null); setMe(null); setSigningOut(false); toast('Signed out successfully');
   };
   const onAuthed = (user, isNew) => {
     setMe(user);
@@ -560,18 +632,19 @@ export default function App() {
     api('/me').then(d => setMe(d.user)).catch(() => setToken(null)).finally(() => setChecking(false));
   }, []);
 
-  if (checking) return null;
   return (
     <>
-      {!me ? <AuthScreen onAuthed={onAuthed} />
-        : !projectId ? <ProjectsScreen me={me} onOpen={openProject} onLogout={logout} toast={toast} />
-        : <BugPage key={projectId} me={me} projectId={projectId} toast={toast} onBack={() => openProject(null)} onLogout={logout} onSignedOut={signedOut} />}
+      <TopProgress />
+      {checking ? <Loader full text="Checking your sign-in…" />
+        : !me ? <AuthScreen onAuthed={onAuthed} />
+        : !projectId ? <ProjectsScreen me={me} onOpen={openProject} onLogout={logout} signingOut={signingOut} toast={toast} />
+        : <BugPage key={projectId} me={me} projectId={projectId} toast={toast} onBack={() => openProject(null)} onLogout={logout} signingOut={signingOut} onSignedOut={signedOut} />}
       <Toast toast={toastState} />
     </>
   );
 }
 
-function BugPage({ me, projectId, onBack, onLogout, onSignedOut, toast }) {
+function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toast }) {
   const [project, setProject] = useState(null);
   const [panels, setPanels] = useState([]);
   const [bugs, setBugs] = useState([]);
@@ -589,16 +662,24 @@ function BugPage({ me, projectId, onBack, onLogout, onSignedOut, toast }) {
   const backRef = useRef(onBack);
   backRef.current = onBack;
 
-  const loadBugs = useCallback(async () => {
+  const [listLoading, setListLoading] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const slow = useSlowHint(!loaded && !loadErr);
+  // silent: background refresh (no loading bar, no dimmed list)
+  const loadBugs = useCallback(async ({ silent } = {}) => {
     const qs = new URLSearchParams([['project', projectId], ...Object.entries(filters).filter(([, v]) => v)]).toString();
+    if (!silent) setListLoading(true);
     try {
-      const d = await api('/bugs?' + qs);
+      const d = await api('/bugs?' + qs, { silent });
       setProject(d.project); setPanels(d.panels);
       setBugs(d.bugs); setCounts(d.counts); setLoadErr(''); setLoaded(true);
     } catch (e) {
       if (e.status === 401) onSignedOut();
       else if (e.status === 404) { toast(e.message, 'error'); backRef.current(); } // removed from the project, or it never existed
       else setLoadErr(e.message);
+    } finally {
+      if (!silent) setListLoading(false);
     }
   }, [filters, projectId, onSignedOut, toast]);
   const [teamOpen, setTeamOpen] = useState(false);
@@ -608,22 +689,31 @@ function BugPage({ me, projectId, onBack, onLogout, onSignedOut, toast }) {
     const file = e.target.files[0];
     e.target.value = '';
     if (!file) return;
+    setImporting(true);
     try {
       const r = await importCsv(projectId, file);
       const msg = `Imported ${r.imported} bug${r.imported === 1 ? '' : 's'} successfully` + (r.duplicates ? ` (${r.duplicates} already here, skipped)` : '');
       toast(r.imported || !r.duplicates ? msg : `Nothing new to import: all ${r.duplicates} bugs are already here`, r.imported ? 'success' : 'error');
       loadBugs();
     } catch (e2) { toast(e2.message, 'error'); }
+    setImporting(false);
+  }
+  async function onExport() {
+    if (!project) return;
+    setExporting(true);
+    try { await downloadCsv(project); toast('CSV exported successfully'); }
+    catch (e) { toast(e.message, 'error'); }
+    setExporting(false);
   }
 
   useEffect(() => {
-    const t = setTimeout(loadBugs, filters.q ? 250 : 0);
+    const t = setTimeout(() => loadBugs(), filters.q ? 250 : 0);
     return () => clearTimeout(t);
   }, [loadBugs, filters.q]);
 
   // Refresh every 15 s so status changes by others show up
   useEffect(() => {
-    const t = setInterval(() => { if (!document.hidden) loadBugs(); }, 15000);
+    const t = setInterval(() => { if (!document.hidden) loadBugs({ silent: true }); }, 15000);
     return () => clearInterval(t);
   }, [loadBugs]);
 
@@ -648,11 +738,11 @@ function BugPage({ me, projectId, onBack, onLogout, onSignedOut, toast }) {
             <button className="btn" onClick={() => setTeamOpen(true)}>Team <span className="n">{users.length || ''}</span></button>
             {isTester(me) && <>
               <input ref={fileRef} type="file" accept=".csv,text/csv" hidden onChange={onImport} />
-              <button className="btn" onClick={() => fileRef.current.click()}>Import CSV</button>
+              <BusyBtn className="btn" busy={importing} busyText="Importing…" onClick={() => fileRef.current.click()}>Import CSV</BusyBtn>
             </>}
-            <button className="btn" onClick={() => project && downloadCsv(project).then(() => toast('CSV exported successfully'), e => toast(e.message, 'error'))}>Export CSV</button>
-            {isTester(me) && <button className="btn primary" onClick={() => setForm({})}>+ Report bug</button>}
-            <button className="btn ghost signout" onClick={logout}>Sign out</button>
+            <BusyBtn className="btn" busy={exporting} disabled={!project} busyText="Exporting…" onClick={onExport}>Export CSV</BusyBtn>
+            {isTester(me) && <button className="btn primary" disabled={!project} onClick={() => setForm({})}>+ Report bug</button>}
+            <BusyBtn className="btn ghost signout" busy={signingOut} busyText="Signing out…" onClick={logout}>Sign out</BusyBtn>
           </div>
         </div>
       </header>
@@ -693,9 +783,16 @@ function BugPage({ me, projectId, onBack, onLogout, onSignedOut, toast }) {
         </div>
 
         {loadErr && <div className="notice">{loadErr}</div>}
+        {slow && <p className="hint slow">The server is waking up. This can take up to a minute the first time.</p>}
 
-        <div className="list">
+        <div className={'list' + (loaded && listLoading ? ' refreshing' : '')} aria-busy={listLoading || undefined}>
           <div className="row head"><span>ID</span><span>Module · Description</span><span>Priority</span><span>Status</span><span>Assignee</span><span>Reported</span></div>
+          {!loaded && !loadErr && <>
+            {[0, 1, 2, 3, 4].map(i => (
+              <div key={i} className="row skeleton" aria-hidden="true"><span /><span /><span /><span /><span /><span /></div>
+            ))}
+            <span className="sr-only" role="status">Loading bugs…</span>
+          </>}
           {loaded && bugs.length === 0 && (
             <div className="empty">
               {total === 0
@@ -721,7 +818,7 @@ function BugPage({ me, projectId, onBack, onLogout, onSignedOut, toast }) {
       </main>
 
       <Modal open={viewId != null} onClose={() => setViewId(null)} className="sheet" labelledBy="view-title">
-        <BugDetail id={viewId} me={me} toast={toast} onClose={() => setViewId(null)} onChanged={loadBugs}
+        <BugDetail id={viewId} me={me} toast={toast} onClose={() => setViewId(null)} onChanged={() => loadBugs()}
           onEdit={bug => { setViewId(null); setForm({ bug }); }} />
       </Modal>
 
