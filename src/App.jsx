@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   api, getToken, setToken, downloadCsv, importCsv, STATUSES, DEV_STATUSES, PRIORITIES, STATUS_VAR, PRIORITY_VAR, fmtDate, fmtTime, today,
   isTester, isAssignable, fileUrl, subscribePending,
+  desktopStatus, enableDesktop, disableDesktop, resyncDesktop, showLocalNotification,
 } from './api.js';
 
 const ROLE_INFO = {
@@ -528,7 +529,14 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
   const [desc, setDesc] = useState('');
   const [creating, setCreating] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [query, setQuery] = useState('');
   const slow = useSlowHint(projects === null && !err);
+  // Every word typed must appear in the project's name or description (any order, any case)
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = (projects || []).filter(p => {
+    const text = `${p.name} ${p.description || ''}`.toLowerCase();
+    return words.every(w => text.includes(w));
+  });
 
   const load = useCallback(() => {
     setRefreshing(true);
@@ -577,6 +585,25 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
           </div>
         )}
         {slow && <p className="hint slow">The server is waking up. This can take up to a minute the first time.</p>}
+        {projects && projects.length > 0 && (
+          <div className="project-search">
+            <input id="p-search" type="search" value={query} onChange={e => setQuery(e.target.value)}
+              placeholder="Search projects by name or description…" aria-label="Search projects" autoComplete="off"
+              onKeyDown={e => {
+                if (e.key === 'Escape') setQuery('');
+                if (e.key === 'Enter' && query && shown.length === 1) onOpen(shown[0].id);
+              }} />
+            {query && <span className="hint" role="status">{shown.length} of {projects.length} project{projects.length === 1 ? '' : 's'}
+              {shown.length === 1 ? ' · press Enter to open' : ''}</span>}
+          </div>
+        )}
+        {projects && projects.length > 0 && shown.length === 0 && (
+          <div className="empty list">
+            <h2>No projects match “{query}”</h2>
+            <p>Try another word, or clear the search.</p>
+            <button className="btn" onClick={() => setQuery('')}>Clear search</button>
+          </div>
+        )}
         {projects && projects.length === 0 && !adding && (
           <div className="empty list">
             {isTester(me)
@@ -586,7 +613,7 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
           </div>
         )}
         <div className="project-grid">
-          {(projects || []).map(p => (
+          {shown.map(p => (
             <button key={p.id} className="project-card" onClick={() => onOpen(p.id)}>
               <span className="p-name">{p.name}</span>
               {p.description && <span className="p-desc">{p.description}</span>}
@@ -657,6 +684,76 @@ function NotifText({ n }) {
   return <span className="n-text"><b>{n.actor_name}</b>{n.actor_role && <span className="role"> ({n.actor_role})</span>} {what}</span>;
 }
 
+// Plain-text version of a notification, for desktop pop-ups shown by the page itself
+function notifPlain(n) {
+  const who = n.actor_name || 'Someone';
+  if (n.type === 'added_to_project')
+    return { title: `${who} added you to ${n.project_name || 'a project'}`, body: 'Open Bug Log to see its bugs.', url: `/#project-${n.project_id}` };
+  const k = n.bug_key;
+  const title = {
+    reported: `${who} reported ${k}`,
+    status: `${who} changed ${k} to ${n.to_status}`,
+    comment: `${who} commented on ${k}`,
+    edited: n.to_status ? `${who} edited ${k} (now ${n.to_status})` : `${who} edited ${k}`,
+    notes: `${who} updated the notes on ${k}`,
+  }[n.type] || `${who} updated ${k}`;
+  const body = [n.bug_title, n.type === 'status' && n.from_status ? `${n.from_status} → ${n.to_status}` : '',
+    n.comment ? `“${n.comment}”` : '', n.project_name].filter(Boolean).join('\n');
+  return { title, body, url: `/#project-${n.project_id}/bug-${n.bug_id}` };
+}
+
+const DESKTOP_TEXT = {
+  off: ['Get Windows desktop notifications', 'A pop-up appears in the corner of your screen for each new notification, even when Bug Log is closed.'],
+  on: ['Desktop notifications are on', 'You’ll get a pop-up for each new notification, even when Bug Log is closed (while Chrome or Edge is running).'],
+  local: ['Desktop notifications are on while Bug Log is open', 'Push isn’t available right now, so pop-ups only appear while a Bug Log tab is open.'],
+  blocked: ['Desktop notifications are blocked', 'Click the icon left of the address bar, set Notifications to Allow, then reload the page.'],
+};
+
+// On/off switch for desktop pop-ups on this browser
+function DesktopCard({ toast }) {
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { desktopStatus().then(setStatus); }, []);
+  if (!status || status === 'unsupported') return null;
+
+  async function turnOn() {
+    setBusy(true);
+    try {
+      const s = await enableDesktop();
+      setStatus(s);
+      toast(s === 'on' ? 'Desktop notifications are on.' : 'Desktop notifications are on while a Bug Log tab is open.');
+    } catch (e) { setStatus(await desktopStatus()); toast(e.message, 'error'); }
+    setBusy(false);
+  }
+  async function turnOff() {
+    setBusy(true);
+    await disableDesktop({ userChoice: true });
+    setStatus(await desktopStatus());
+    toast('Desktop notifications are off for this browser.');
+    setBusy(false);
+  }
+  const test = () => showLocalNotification({
+    title: 'Bug Log', body: 'Desktop notifications are working.', url: '/#notifications', tag: 'bug-log-test',
+  });
+
+  const [title, text] = DESKTOP_TEXT[status];
+  return (
+    <div className={'desktop-card ' + status} role="region" aria-label="Desktop notifications">
+      <svg className="dc-icon" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8M12 17v4" />
+      </svg>
+      <div className="dc-text"><b>{title}</b><small>{text}</small></div>
+      <div className="dc-actions">
+        {status === 'off' && <BusyBtn className="btn primary" busy={busy} busyText="Turning on…" onClick={turnOn}>Turn on</BusyBtn>}
+        {(status === 'on' || status === 'local') && <>
+          <button className="btn" onClick={test}>Send a test</button>
+          <BusyBtn className="btn ghost" busy={busy} busyText="Turning off…" onClick={turnOff}>Turn off</BusyBtn>
+        </>}
+      </div>
+    </div>
+  );
+}
+
 function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toast }) {
   const [tab, setTab] = useState('all');
   const [items, setItems] = useState(null);
@@ -709,6 +806,7 @@ function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toas
           </div>
           <BusyBtn className="btn" busy={markingAll} disabled={!unread} busyText="Marking…" onClick={markAll}>Mark all as read</BusyBtn>
         </div>
+        <DesktopCard toast={toast} />
         {err && <div className="notice">{err}</div>}
         <div className="list" aria-busy={items === null || undefined}>
           {items === null && !err && <Loader text="Loading notifications…" />}
@@ -763,12 +861,33 @@ export default function App() {
 
   // Unread notification count for the bell, refreshed in the background
   const [unread, setUnread] = useState(0);
+  const prevUnread = useRef(null);
+  const popped = useRef({ since: 0, ids: new Set() });
+  // Fallback when push isn't available: the open tab shows pop-ups for new notifications itself
+  const popLocal = useCallback(async () => {
+    if ((await desktopStatus()) !== 'local') return;
+    const { notifications } = await api('/notifications?unread=1', { silent: true });
+    const fresh = notifications
+      .filter(n => new Date(n.created_at).getTime() >= popped.current.since && !popped.current.ids.has(n.id))
+      .slice(0, 5).reverse();
+    for (const n of fresh) {
+      popped.current.ids.add(n.id);
+      showLocalNotification({ ...notifPlain(n), tag: 'bug-log-' + n.id });
+    }
+  }, []);
   const refreshUnread = useCallback(() => {
     if (!getToken()) return;
-    api('/notifications/unread-count', { silent: true }).then(d => setUnread(d.unread)).catch(() => {});
-  }, []);
+    api('/notifications/unread-count', { silent: true }).then(d => {
+      const prev = prevUnread.current;
+      prevUnread.current = d.unread;
+      setUnread(d.unread);
+      if (prev !== null && d.unread > prev) popLocal().catch(() => {});
+    }).catch(() => {});
+  }, [popLocal]);
   useEffect(() => {
-    if (!me) { setUnread(0); return; }
+    if (!me) { setUnread(0); prevUnread.current = null; return; }
+    popped.current = { since: Date.now() - 60000, ids: new Set() };
+    resyncDesktop(); // this browser's desktop notifications now go to whoever just signed in
     refreshUnread();
     const t = setInterval(() => { if (!document.hidden) refreshUnread(); }, NOTIF_POLL_MS);
     const onVisible = () => { if (!document.hidden) refreshUnread(); };
@@ -779,6 +898,7 @@ export default function App() {
   const logout = async () => {
     if (signingOut) return;
     setSigningOut(true);
+    await disableDesktop(); // stop this browser getting the signed-out person's notifications
     await api('/auth/logout', { method: 'POST' }).catch(() => {});
     setToken(null); setMe(null); setSigningOut(false); toast('Signed out successfully');
   };
@@ -787,6 +907,18 @@ export default function App() {
     toast(isNew ? `Account created. Welcome, ${user.name} (${user.role})!` : `Signed in. Welcome back, ${user.name}!`);
   };
   const signedOut = useCallback(() => { setToken(null); setMe(null); toast('Your session ended. Please sign in again.', 'error'); }, [toast]);
+
+  // A click on a desktop pop-up: the service worker asks this tab to open the bug
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const onMessage = e => {
+      if (e.data?.type !== 'open-url') return;
+      const target = new URL(e.data.url, location.origin);
+      if (target.origin === location.origin) location.hash = target.hash;
+    };
+    navigator.serviceWorker.addEventListener('message', onMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onMessage);
+  }, []);
 
   useEffect(() => {
     if (!getToken()) return;
