@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import {
   api, getToken, setToken, downloadCsv, importCsv, STATUSES, DEV_STATUSES, PRIORITIES, STATUS_VAR, PRIORITY_VAR, fmtDate, fmtTime, today,
   isTester, isAdmin, isAssignable, fileUrl, startKeepAlive,
   desktopStatus, enableDesktop, disableDesktop, resyncDesktop, showLocalNotification,
 } from './api.js';
-import AdminScreen from './AdminScreen.jsx';
-import { AdminBadge, BusyBtn, Loader, Spinner, TopProgress, TopRight, useSlowHint } from './ui.jsx';
+import MembersScreen from './MembersScreen.jsx';
+import { AdminBadge, BusyBtn, Loader, MembersIcon, Spinner, TopProgress, TopRight, useSlowHint } from './ui.jsx';
 
 // Roles people can sign up for. The super admin approves every new account.
 const ROLE_INFO = {
@@ -487,7 +487,7 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
             <BusyBtn className="btn primary" busy={busy && !confirmId} disabled={!pick || busy} busyText="Adding…" onClick={add}>Add to project</BusyBtn>
           </div>
         )}
-        {canManage && <p className="hint">Not in the list? They need to request an account, and you approve it in the <a href="#admin">admin panel</a>.</p>}
+        {canManage && <p className="hint">Not in the list? They need to request an account, and you approve it on the <a href="#members">Members</a> page.</p>}
         {members.length === 0 && <p className="hint">No one is on this project yet.</p>}
         <ul className="team">
           {members.map(m => (
@@ -508,6 +508,7 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
 
 // ---------- project picker ----------
 function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
+  const { pending: adminPending } = useContext(AdminBadge); // sign-up requests waiting (super admin)
   const [projects, setProjects] = useState(null);
   const [err, setErr] = useState('');
   const [adding, setAdding] = useState(false);
@@ -553,7 +554,12 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
       <main className="wrap projects">
         <div className="projects-head">
           <h2>Select a project</h2>
-          {!adding && isAdmin(me) && <button className="btn primary" onClick={() => setAdding(true)}>+ New project</button>}
+          {isAdmin(me) && (
+            <div className="row-btns">
+              <a className="btn" href="#members"><MembersIcon /> Members{adminPending > 0 && <span className="pill-count">{adminPending} waiting</span>}</a>
+              {!adding && <button className="btn primary" onClick={() => setAdding(true)}>+ New project</button>}
+            </div>
+          )}
         </div>
         {adding && (
           <form className="new-project" onSubmit={create}>
@@ -812,10 +818,10 @@ function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toas
   );
 }
 
-// #notifications | #admin | #project-3 | #project-3/bug-12 | (empty) = project list
+// #notifications | #members (or #admin) | #project-3 | #project-3/bug-12 | (empty) = project list
 const parseHash = () => {
   if (location.hash === '#notifications') return { view: 'notifications' };
-  if (location.hash === '#admin') return { view: 'admin' };
+  if (location.hash === '#members' || location.hash === '#admin') return { view: 'admin' };
   const m = location.hash.match(/^#project-(\d+)(?:\/bug-(\d+))?$/);
   return m ? { view: 'project', projectId: Number(m[1]), bugId: m[2] ? Number(m[2]) : null } : { view: 'projects' };
 };
@@ -919,7 +925,7 @@ export default function App() {
         : route.view === 'notifications'
           ? <NotificationsScreen me={me} unread={unread} onChanged={refreshUnread} onLogout={logout} signingOut={signingOut} toast={toast} />
         : route.view === 'admin' && admin
-          ? <AdminScreen me={me} unread={unread} onChanged={() => { refreshAdmin(); refreshUnread(); }}
+          ? <MembersScreen me={me} unread={unread} onChanged={() => { refreshAdmin(); refreshUnread(); }}
               onLogout={logout} signingOut={signingOut} onSignedOut={signedOut} toast={toast} />
         : route.view === 'projects' || route.view === 'admin'
           ? <ProjectsScreen me={me} onOpen={openProject} onLogout={logout} signingOut={signingOut} unread={unread} toast={toast} />
