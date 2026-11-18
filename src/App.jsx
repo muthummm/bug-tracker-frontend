@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   api, getToken, setToken, downloadCsv, importCsv, STATUSES, DEV_STATUSES, PRIORITIES, STATUS_VAR, PRIORITY_VAR, fmtDate, fmtTime, today,
-  isTester, isAssignable, fileUrl, subscribePending,
+  isTester, isAdmin, isAssignable, fileUrl,
   desktopStatus, enableDesktop, disableDesktop, resyncDesktop, showLocalNotification,
 } from './api.js';
+import AdminScreen from './AdminScreen.jsx';
+import { AdminBadge, BusyBtn, Loader, Spinner, TopProgress, TopRight, useSlowHint } from './ui.jsx';
 
+// Roles people can sign up for. The super admin approves every new account.
 const ROLE_INFO = {
-  Tester: 'Report bugs, import sheets, edit bug details, and verify fixes: close or reopen bugs.',
-  Developer: 'Work on bugs: move them to In Progress, Fixed, Ready for Retest or Not a Bug, comment and add notes.',
-  Manager: 'Oversee projects with the same access as a tester. Bugs are never assigned to managers.',
+  Tester: ['Tester (QA)', 'Report bugs, import sheets, edit bug details, and verify fixes: close or reopen bugs.'],
+  Developer: ['Developer', 'Work on bugs: move them to In Progress, Fixed, Ready for Retest or Not a Bug, comment and add notes.'],
 };
 
 // ---------- small pieces ----------
@@ -20,49 +22,6 @@ const StatusPill = ({ status }) => (
 const Priority = ({ priority }) => (
   <span className={'pri' + (priority ? '' : ' unset')}><span className="bar" style={{ '--c': `var(${PRIORITY_VAR[priority] || '--line'})` }} />{priority || 'Not set'}</span>
 );
-
-// ---------- loading indicators ----------
-const Spinner = ({ size }) => <span className={'spinner' + (size ? ' ' + size : '')} aria-hidden="true" />;
-
-// A button that shows a spinner and "busyText" while its request is pending.
-function BusyBtn({ busy, busyText, disabled, children, className = 'btn', ...rest }) {
-  return (
-    <button className={className + (busy ? ' is-busy' : '')} disabled={busy || disabled} aria-busy={busy || undefined} {...rest}>
-      {busy && <Spinner />}{busy && busyText ? busyText : children}
-    </button>
-  );
-}
-
-function Loader({ text = 'Loading…', full }) {
-  return <div className={'loader' + (full ? ' full' : '')} role="status"><Spinner size="lg" /><span>{text}</span></div>;
-}
-
-// Thin bar across the top of the page while any API request is pending.
-// Waits 150 ms before showing so very fast requests don't flicker.
-function TopProgress() {
-  const [active, setActive] = useState(false);
-  useEffect(() => {
-    let t;
-    const unsub = subscribePending(n => {
-      clearTimeout(t);
-      if (n > 0) t = setTimeout(() => setActive(true), 150);
-      else setActive(false);
-    });
-    return () => { clearTimeout(t); unsub(); };
-  }, []);
-  return <div className={'top-progress' + (active ? ' on' : '')} role="progressbar" aria-hidden={!active} aria-label="Loading" />;
-}
-
-// The free backend host sleeps when idle; tell the user if the first request is slow.
-function useSlowHint(busy, ms = 5000) {
-  const [slow, setSlow] = useState(false);
-  useEffect(() => {
-    if (!busy) { setSlow(false); return; }
-    const t = setTimeout(() => setSlow(true), ms);
-    return () => clearTimeout(t);
-  }, [busy, ms]);
-  return slow;
-}
 
 // toast('Saved') shows a green success message; toast(msg, 'error') a red one.
 function useToast() {
@@ -76,19 +35,24 @@ function useToast() {
   return [t, show];
 }
 
-// Shown as a popover so it sits above open dialogs (which live in the browser's top layer).
+// The toast exists only while it has a message (a new one per toast, keyed by id), so the page can
+// never be left with an empty box. Shown as a popover so it sits above open dialogs (the browser's top layer).
 function Toast({ toast }) {
+  return toast ? <ToastBox key={toast.id} toast={toast} /> : null;
+}
+
+function ToastBox({ toast }) {
   const ref = useRef();
   useEffect(() => {
     const el = ref.current;
-    if (!el?.showPopover) return;
-    try { el.hidePopover(); } catch { /* not open */ }
-    if (toast) el.showPopover();
-  }, [toast]);
+    if (!el.showPopover) return; // older browsers: shown as a normal fixed box
+    el.setAttribute('popover', 'manual');
+    try { el.showPopover(); } catch { /* already open */ }
+    return () => { try { el.hidePopover(); } catch { /* already closed */ } };
+  }, []);
   return (
-    <div ref={el => { ref.current = el; el?.setAttribute('popover', 'manual'); }}
-      className={'toast ' + (toast?.kind || '')} role={toast?.kind === 'error' ? 'alert' : 'status'}>
-      {toast && <><span className="t-icon" aria-hidden="true">{toast.kind === 'error' ? '!' : '✓'}</span>{toast.msg}</>}
+    <div ref={ref} className={'toast ' + toast.kind} role={toast.kind === 'error' ? 'alert' : 'status'}>
+      <span className="t-icon" aria-hidden="true">{toast.kind === 'error' ? '!' : '✓'}</span>{toast.msg}
     </div>
   );
 }
@@ -111,22 +75,31 @@ function Modal({ open, onClose, className, children, labelledBy, canClose = () =
 }
 
 // ---------- login / register ----------
-function AuthScreen({ onAuthed }) {
+function AuthScreen({ onAuthed, toast }) {
   const [mode, setMode] = useState('login');
   const [f, setF] = useState({ name: '', username: '', password: '', role: 'Tester' });
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const [showPw, setShowPw] = useState(false);
+  const [requested, setRequested] = useState(null); // the sign-up request just sent: { name, role }
   const slow = useSlowHint(busy);
   const set = k => e => setF({ ...f, [k]: e.target.value });
+  const switchMode = to => { setMode(to); setErr(''); setRequested(null); };
 
   async function submit(e) {
     e.preventDefault();
     setErr(''); setBusy(true);
     try {
       const data = await api(`/auth/${mode}`, { method: 'POST', body: f });
+      if (data.pending) {
+        // New accounts wait for the super admin's approval: no sign-in yet
+        setRequested(data.user);
+        setMode('login'); setF(prev => ({ ...prev, password: '' })); setBusy(false);
+        toast('Request sent. The admin will review your account.');
+        return;
+      }
       setToken(data.token);
-      onAuthed(data.user, mode === 'register');
+      onAuthed(data.user);
     } catch (e2) { setErr(e2.message); setBusy(false); }
   }
 
@@ -134,15 +107,24 @@ function AuthScreen({ onAuthed }) {
     <div className="auth">
       <form className="auth-card" onSubmit={submit} aria-busy={busy || undefined}>
         <h1>Bug Log</h1>
-        <p className="muted">{mode === 'login' ? 'Sign in to report and track bugs.' : 'Create an account for a tester, developer or manager.'}</p>
+        {requested && (
+          <div className="request-sent" role="status">
+            <b>Request sent to the admin</b>
+            <span>Thanks, {requested.name}. Your {requested.role === 'Tester' ? 'Tester (QA)' : requested.role} account is waiting for approval.
+              You can sign in here as soon as the admin approves it.</span>
+          </div>
+        )}
+        <p className="muted">{mode === 'login'
+          ? 'Sign in to report and track bugs.'
+          : 'Request an account as a tester or developer. The admin approves new accounts before you can sign in.'}</p>
         {mode === 'register' && (
           <>
             <fieldset className="roles">
               <legend>What is your role?</legend>
-              {Object.entries(ROLE_INFO).map(([role, info]) => (
+              {Object.entries(ROLE_INFO).map(([role, [label, info]]) => (
                 <label key={role} className="role-card">
                   <input type="radio" name="role" value={role} checked={f.role === role} onChange={set('role')} />
-                  <span><b>{role}</b><small>{info}</small></span>
+                  <span><b>{label}</b><small>{info}</small></span>
                 </label>
               ))}
             </fieldset>
@@ -159,11 +141,11 @@ function AuthScreen({ onAuthed }) {
           {mode === 'register' && <span className="hint">At least 6 characters</span>}
         </label>
         {err && <p className="err">{err}</p>}
-        <BusyBtn className="btn primary" busy={busy} busyText={mode === 'login' ? 'Signing in…' : 'Creating account…'}>
-          {mode === 'login' ? 'Sign in' : 'Create account'}</BusyBtn>
+        <BusyBtn className="btn primary" busy={busy} busyText={mode === 'login' ? 'Signing in…' : 'Sending request…'}>
+          {mode === 'login' ? 'Sign in' : 'Request account'}</BusyBtn>
         {slow && <p className="hint slow">The server is waking up. This can take up to a minute the first time.</p>}
-        <button type="button" className="link-btn" disabled={busy} onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setErr(''); }}>
-          {mode === 'login' ? 'New here? Create an account' : 'Already have an account? Sign in'}
+        <button type="button" className="link-btn" disabled={busy} onClick={() => switchMode(mode === 'login' ? 'register' : 'login')}>
+          {mode === 'login' ? 'New here? Request an account' : 'Already approved? Sign in'}
         </button>
       </form>
     </div>
@@ -212,9 +194,10 @@ function BugForm({ bug, project, users, modules, panels, onSaved, onCancel, dirt
     } catch (e2) { setErr(e2.message); setBusy(false); }
   }
 
-  // Managers are never assignees
-  const developers = users.filter(u => u.role === 'Developer');
-  const others = users.filter(u => u.role === 'Tester');
+  // Assignees: active developers and testers on the team (plus whoever is assigned now, even if since deactivated)
+  const pickable = users.filter(u => isAssignable(u) && (u.status !== 'inactive' || String(u.id) === String(initial.assignee_id)));
+  const developers = pickable.filter(u => u.role === 'Developer');
+  const others = pickable.filter(u => u.role === 'Tester');
 
   return (
     <form onSubmit={submit} noValidate
@@ -435,7 +418,7 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, onNotificationsChanged,
 
         <div className="row-btns">
           {tester && <button className="btn" onClick={() => onEdit(b)}>Edit all fields</button>}
-          {b.reporter_id === me.id && <button className="btn danger" onClick={() => setConfirmDel(true)}>Delete</button>}
+          {(b.reporter_id === me.id || isAdmin(me)) && <button className="btn danger" onClick={() => setConfirmDel(true)}>Delete</button>}
         </div>
         {confirmDel && (
           <div className="confirm">
@@ -450,17 +433,18 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, onNotificationsChanged,
 }
 
 // ---------- team (project members) ----------
+// Everyone can see the team; only the super admin adds or removes people.
 function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
-  const tester = isTester(me);
+  const canManage = isAdmin(me);
   const [everyone, setEveryone] = useState([]);
   const [pick, setPick] = useState('');
   const [busy, setBusy] = useState(false);
   const [confirmId, setConfirmId] = useState(null);
-  const [loadingPeople, setLoadingPeople] = useState(tester);
+  const [loadingPeople, setLoadingPeople] = useState(canManage);
 
   useEffect(() => {
-    if (tester) api('/users').then(setEveryone).catch(() => {}).finally(() => setLoadingPeople(false));
-  }, [tester]);
+    if (canManage) api('/users').then(setEveryone).catch(() => {}).finally(() => setLoadingPeople(false));
+  }, [canManage]);
   const memberIds = new Set(members.map(m => m.id));
   const candidates = everyone.filter(u => !memberIds.has(u.id));
 
@@ -489,12 +473,13 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
       <div className="dlg-head"><h2 id="team-title">Team · {project.name}</h2>
         <button className="x" onClick={onClose} aria-label="Close">×</button></div>
       <div className="dlg-body">
-        <p className="hint">Only the people listed here can see this project and its bugs.{tester ? ' Add a developer, tester or manager to give them access.' : ''}</p>
-        {tester && (
+        <p className="hint">Only the people listed here (and the admin) can see this project and its bugs.
+          {canManage ? ' Add a developer or tester to give them access.' : ' Ask the admin to add or remove people.'}</p>
+        {canManage && (
           <div className="team-add">
             <select id="t-pick" value={pick} onChange={e => setPick(e.target.value)} aria-label="Person to add" disabled={loadingPeople}>
-              <option value="">{loadingPeople ? 'Loading people…' : candidates.length ? 'Choose a person to add…' : 'Everyone with an account is already here'}</option>
-              {['Developer', 'Tester', 'Manager'].map(role => {
+              <option value="">{loadingPeople ? 'Loading people…' : candidates.length ? 'Choose a person to add…' : 'Every active tester and developer is already here'}</option>
+              {['Developer', 'Tester'].map(role => {
                 const list = candidates.filter(u => u.role === role);
                 return list.length > 0 && <optgroup key={role} label={role + 's'}>{list.map(u => <option key={u.id} value={u.id}>{u.name} ({u.username})</option>)}</optgroup>;
               })}
@@ -502,13 +487,14 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
             <BusyBtn className="btn primary" busy={busy && !confirmId} disabled={!pick || busy} busyText="Adding…" onClick={add}>Add to project</BusyBtn>
           </div>
         )}
-        {tester && <p className="hint">Not in the list? They need to create an account first (choose "Create an account" on the sign-in page).</p>}
+        {canManage && <p className="hint">Not in the list? They need to request an account, and you approve it in the <a href="#admin">admin panel</a>.</p>}
+        {members.length === 0 && <p className="hint">No one is on this project yet.</p>}
         <ul className="team">
           {members.map(m => (
             <li key={m.id}>
               <span className="t-who"><b>{m.name}</b>{m.id === me.id && <span className="you"> (you)</span>}
-                <small>{m.username} · {m.role}{m.pending ? ' · hasn’t set a password yet' : ''}{m.added_by_name ? ` · added by ${m.added_by_name}` : ''}</small></span>
-              {tester && (confirmId === m.id
+                <small>{m.username} · {m.role}{m.status && m.status !== 'active' ? ` · account ${m.status}` : ''}{m.added_by_name ? ` · added by ${m.added_by_name}` : ''}</small></span>
+              {canManage && (confirmId === m.id
                 ? <span className="t-confirm">Remove? <BusyBtn className="btn danger" busy={busy} busyText="Removing…" onClick={() => remove(m)}>Yes, remove</BusyBtn>
                     <button className="btn" disabled={busy} onClick={() => setConfirmId(null)}>Keep</button></span>
                 : <button className="btn ghost danger" onClick={() => setConfirmId(m.id)}>Remove</button>)}
@@ -567,7 +553,7 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
       <main className="wrap projects">
         <div className="projects-head">
           <h2>Select a project</h2>
-          {!adding && isTester(me) && <button className="btn primary" onClick={() => setAdding(true)}>+ New project</button>}
+          {!adding && isAdmin(me) && <button className="btn primary" onClick={() => setAdding(true)}>+ New project</button>}
         </div>
         {adding && (
           <form className="new-project" onSubmit={create}>
@@ -606,9 +592,9 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
         )}
         {projects && projects.length === 0 && !adding && (
           <div className="empty list">
-            {isTester(me)
-              ? <><h2>No projects yet</h2><p>Create a project, then add your developers to it from Team.</p></>
-              : <><h2>You haven't been added to a project yet</h2><p>Ask your tester or manager to add <b>{me.username}</b> to a project. It will show up here right after.</p>
+            {isAdmin(me)
+              ? <><h2>No projects yet</h2><p>Create a project, then add testers and developers to it from Team.</p></>
+              : <><h2>You haven't been added to a project yet</h2><p>Ask the admin to add <b>{me.username}</b> to a project. It will show up here right after.</p>
                   <BusyBtn className="btn" busy={refreshing} busyText="Checking…" onClick={load}>Check again</BusyBtn></>}
           </div>
         )}
@@ -636,27 +622,6 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
 // ---------- notifications ----------
 const NOTIF_POLL_MS = 20000;
 
-// Bell in the top-right corner; the red dot shows how many notifications are unread.
-function Bell({ count, active }) {
-  const label = count ? `Notifications, ${count} unread` : 'Notifications';
-  return (
-    <a className={'btn ghost bell' + (active ? ' active' : '')} href="#notifications" aria-label={label} title={label}
-      aria-current={active ? 'page' : undefined}>
-      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
-      </svg>
-      {count > 0 && <span className="bell-dot">{count > 99 ? '99+' : count}</span>}
-    </a>
-  );
-}
-
-const TopRight = ({ unread, onLogout, signingOut, bellActive }) => (
-  <div className="top-right">
-    <Bell count={unread} active={bellActive} />
-    <BusyBtn className="btn ghost signout" busy={signingOut} busyText="Signing out…" onClick={onLogout}>Sign out</BusyBtn>
-  </div>
-);
-
 const relTime = s => {
   const sec = Math.round((Date.now() - new Date(s)) / 1000);
   if (sec < 60) return 'just now';
@@ -668,6 +633,9 @@ const relTime = s => {
 
 // "Tom Tester changed BUG-012 from Open to In Progress"
 function NotifText({ n }) {
+  if (n.type === 'signup_request') {
+    return <span className="n-text"><b>{n.actor_name}</b>{n.actor_role && <span className="role"> ({n.actor_role})</span>} requested an account</span>;
+  }
   if (n.type === 'added_to_project') {
     return <span className="n-text"><b>{n.actor_name}</b>{n.actor_role && <span className="role"> ({n.actor_role})</span>} added you to the project <b>{n.project_name || 'a project'}</b></span>;
   }
@@ -687,6 +655,8 @@ function NotifText({ n }) {
 // Plain-text version of a notification, for desktop pop-ups shown by the page itself
 function notifPlain(n) {
   const who = n.actor_name || 'Someone';
+  if (n.type === 'signup_request')
+    return { title: `${who} wants to join as ${n.actor_role || 'a user'}`, body: 'Approve or reject the request in the admin panel.', url: '/#admin' };
   if (n.type === 'added_to_project')
     return { title: `${who} added you to ${n.project_name || 'a project'}`, body: 'Open Bug Log to see its bugs.', url: `/#project-${n.project_id}` };
   const k = n.bug_key;
@@ -775,6 +745,7 @@ function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toas
       setItems(list => list.map(x => (x.id === n.id ? { ...x, read: true } : x)));
       api(`/notifications/${n.id}/read`, { method: 'PATCH', silent: true }).then(onChanged, () => {});
     }
+    if (n.type === 'signup_request') { location.hash = 'admin'; return; }
     if (!n.bug_id) { location.hash = `project-${n.project_id}`; return; } // project-level, e.g. "added you to …"
     if (!n.bug_title) { toast(`${n.bug_key} was deleted.`, 'error'); return; }
     location.hash = `project-${n.project_id}/bug-${n.bug_id}`;
@@ -813,8 +784,8 @@ function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toas
           {items && items.length === 0 && (
             <div className="empty">
               <h2>{tab === 'unread' ? 'You’re all caught up' : 'No notifications yet'}</h2>
-              <p>{me.role === 'Manager'
-                ? 'You’ll hear about every change to bugs in your projects.'
+              <p>{isAdmin(me)
+                ? 'You’ll hear when someone requests an account, and about bugs you reported.'
                 : me.role === 'Developer'
                   ? 'You’ll hear when bugs assigned to you are reported, changed or commented on.'
                   : 'You’ll hear when bugs you reported or are assigned to are changed or commented on.'}</p>
@@ -825,7 +796,9 @@ function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toas
               <span className="n-dot" aria-label={n.read ? undefined : 'Unread'} />
               <span className="n-main">
                 <NotifText n={n} />
-                <small>{!n.bug_id ? 'Open the project to see its bugs'
+                <small>{n.type === 'signup_request'
+                  ? `Username ${n.subject_username || '—'} · ${n.subject_status === 'pending' ? 'waiting for your approval' : `request ${n.subject_status === 'rejected' ? 'rejected' : 'approved'}`}`
+                  : !n.bug_id ? 'Open the project to see its bugs'
                   : `${n.project_name || 'Project'}${n.bug_title ? ` · ${n.bug_title}` : ' · bug deleted'}`}</small>
                 {n.comment && <span className="n-comment">“{n.comment}”</span>}
               </span>
@@ -839,9 +812,10 @@ function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toas
   );
 }
 
-// #notifications | #project-3 | #project-3/bug-12 | (empty) = project list
+// #notifications | #admin | #project-3 | #project-3/bug-12 | (empty) = project list
 const parseHash = () => {
   if (location.hash === '#notifications') return { view: 'notifications' };
+  if (location.hash === '#admin') return { view: 'admin' };
   const m = location.hash.match(/^#project-(\d+)(?:\/bug-(\d+))?$/);
   return m ? { view: 'project', projectId: Number(m[1]), bugId: m[2] ? Number(m[2]) : null } : { view: 'projects' };
 };
@@ -884,16 +858,26 @@ export default function App() {
       if (prev !== null && d.unread > prev) popLocal().catch(() => {});
     }).catch(() => {});
   }, [popLocal]);
+  // Super admin: number of sign-up requests waiting, shown on the header's Admin link
+  const admin = isAdmin(me);
+  const [adminPending, setAdminPending] = useState(0);
+  const refreshAdmin = useCallback(() => {
+    if (!admin || !getToken()) return;
+    api('/admin/summary', { silent: true }).then(d => setAdminPending(d.counts.pending)).catch(() => {});
+  }, [admin]);
+  const adminBadge = { show: admin, pending: adminPending, refresh: refreshAdmin };
+
   useEffect(() => {
-    if (!me) { setUnread(0); prevUnread.current = null; return; }
+    if (!me) { setUnread(0); setAdminPending(0); prevUnread.current = null; return; }
     popped.current = { since: Date.now() - 60000, ids: new Set() };
     resyncDesktop(); // this browser's desktop notifications now go to whoever just signed in
-    refreshUnread();
-    const t = setInterval(() => { if (!document.hidden) refreshUnread(); }, NOTIF_POLL_MS);
-    const onVisible = () => { if (!document.hidden) refreshUnread(); };
+    const refresh = () => { refreshUnread(); refreshAdmin(); };
+    refresh();
+    const t = setInterval(() => { if (!document.hidden) refresh(); }, NOTIF_POLL_MS);
+    const onVisible = () => { if (!document.hidden) refresh(); };
     document.addEventListener('visibilitychange', onVisible);
     return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVisible); };
-  }, [me, refreshUnread]);
+  }, [me, refreshUnread, refreshAdmin]);
   const [signingOut, setSigningOut] = useState(false);
   const logout = async () => {
     if (signingOut) return;
@@ -902,9 +886,9 @@ export default function App() {
     await api('/auth/logout', { method: 'POST' }).catch(() => {});
     setToken(null); setMe(null); setSigningOut(false); toast('Signed out successfully');
   };
-  const onAuthed = (user, isNew) => {
+  const onAuthed = user => {
     setMe(user);
-    toast(isNew ? `Account created. Welcome, ${user.name} (${user.role})!` : `Signed in. Welcome back, ${user.name}!`);
+    toast(`Signed in. Welcome back, ${user.name}!`);
   };
   const signedOut = useCallback(() => { setToken(null); setMe(null); toast('Your session ended. Please sign in again.', 'error'); }, [toast]);
 
@@ -926,18 +910,21 @@ export default function App() {
   }, []);
 
   return (
-    <>
+    <AdminBadge.Provider value={adminBadge}>
       <TopProgress />
       {checking ? <Loader full text="Checking your sign-in…" />
-        : !me ? <AuthScreen onAuthed={onAuthed} />
+        : !me ? <AuthScreen onAuthed={onAuthed} toast={toast} />
         : route.view === 'notifications'
           ? <NotificationsScreen me={me} unread={unread} onChanged={refreshUnread} onLogout={logout} signingOut={signingOut} toast={toast} />
-        : route.view === 'projects'
+        : route.view === 'admin' && admin
+          ? <AdminScreen me={me} unread={unread} onChanged={() => { refreshAdmin(); refreshUnread(); }}
+              onLogout={logout} signingOut={signingOut} onSignedOut={signedOut} toast={toast} />
+        : route.view === 'projects' || route.view === 'admin'
           ? <ProjectsScreen me={me} onOpen={openProject} onLogout={logout} signingOut={signingOut} unread={unread} toast={toast} />
         : <BugPage key={route.projectId} me={me} projectId={route.projectId} bugId={route.bugId} toast={toast} unread={unread}
             onNotificationsChanged={refreshUnread} onBack={() => openProject(null)} onLogout={logout} signingOut={signingOut} onSignedOut={signedOut} />}
       <Toast toast={toastState} />
-    </>
+    </AdminBadge.Provider>
   );
 }
 
