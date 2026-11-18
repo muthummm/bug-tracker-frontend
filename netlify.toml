@@ -1,5 +1,5 @@
 # Netlify: build the React app and publish the dist folder.
-# Set VITE_API_URL in Netlify > Site configuration > Environment variables.
+# The backend address comes from src/appConfig.js (production = the Render URL).
 [build]
   command = "npm run build"
   publish = "dist"

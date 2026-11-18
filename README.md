@@ -9,14 +9,19 @@ Start the backend first (it runs on http://localhost:3001), then:
 npm install
 npm run dev
 ```
-Open http://localhost:5173. In development, Vite forwards `/api` and `/uploads` to the backend, so no settings are needed.
+Open http://localhost:5173. In development the app calls the backend at `http://localhost:3001`, so no settings are needed.
 
 ## Settings
-| Name | Example | What it is |
-|---|---|---|
-| `VITE_API_URL` | `https://bug-tracker-backend.onrender.com` | Backend address, no trailing slash. Leave empty for local dev |
+The backend address is in `src/appConfig.js`, chosen by NODE_ENV:
 
-It is read **at build time**. After changing it on your host, redeploy.
+| Environment | Backend |
+|---|---|
+| development (`npm run dev`) | `http://localhost:3001` |
+| production (`npm run build`) | `https://bug-tracker-backend-n2hp.onrender.com` |
+
+While the app is open it pings `/api/health` every 10 seconds so the free Render server stays awake.
+
+Optional: set `VITE_API_URL` (no trailing slash) to point a build at a different backend. It is read at build time.
 
 ## Build
 ```bash
@@ -28,8 +33,7 @@ npm run preview    # serve dist/ locally to check it
 1. Push this project to GitHub.
 2. Netlify → **Add new site → Import an existing project** → pick the repo.
    Build command and publish folder come from `netlify.toml` (`npm run build`, `dist`).
-3. **Site configuration → Environment variables**: add `VITE_API_URL` = your Render backend URL. Redeploy.
-4. Put the Netlify site address in the backend's `CORS_ORIGIN` setting on Render.
+3. Put the Netlify site address in the backend's `CORS_ORIGIN` setting on Render.
 
 The app uses hash links (`#project-2`), so no redirect rules are needed.
 

@@ -1,7 +1,9 @@
 // Small fetch wrapper that adds the login token and turns errors into messages.
 
-// Backend address, set at build time (VITE_API_URL). Empty = same origin (local dev uses Vite's proxy).
-export const API_URL = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+import { appConfig } from './appConfig.js';
+
+// Backend address for this environment (see appConfig.js).
+export const API_URL = appConfig.apiUrl;
 /** Full URL for a file the backend serves, e.g. "/uploads/abc" -> "https://api.example.com/uploads/abc". */
 export const fileUrl = path => (path && path.startsWith('/') ? API_URL + path : path);
 const OFFLINE = 'Cannot reach the server. If it was asleep, wait a few seconds and try again.';
@@ -60,7 +62,7 @@ async function request(path, { method, body, form }) {
 // The free backend host sleeps after ~15 minutes without requests, and waking up takes about a minute.
 // While the app is open, ping the health check every 10 s so it stays awake. Quiet: no loading bar,
 // no sign-in needed, errors ignored (the next ping simply tries again).
-export const KEEP_ALIVE_MS = 10_000;
+export const KEEP_ALIVE_MS = appConfig.keepAliveMs;
 export function startKeepAlive(ms = KEEP_ALIVE_MS) {
   const ping = () => fetch(`${API_URL}/api/health`, { cache: 'no-store' }).catch(() => {});
   ping();
