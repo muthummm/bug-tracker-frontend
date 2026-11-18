@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   api, getToken, setToken, downloadCsv, importCsv, STATUSES, DEV_STATUSES, PRIORITIES, STATUS_VAR, PRIORITY_VAR, fmtDate, fmtTime, today,
-  isTester, isAdmin, isAssignable, fileUrl,
+  isTester, isAdmin, isAssignable, fileUrl, startKeepAlive,
   desktopStatus, enableDesktop, disableDesktop, resyncDesktop, showLocalNotification,
 } from './api.js';
 import AdminScreen from './AdminScreen.jsx';
@@ -830,6 +830,8 @@ export default function App() {
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
+  // Keeps the free backend awake while the app is open (also on the sign-in page)
+  useEffect(() => startKeepAlive(), []);
   const [toastState, toast] = useToast();
   const openProject = id => { location.hash = id ? 'project-' + id : ''; };
 

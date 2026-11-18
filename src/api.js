@@ -56,7 +56,19 @@ async function request(path, { method, body, form }) {
   return data;
 }
 
-export const importCsv = (projectId, file) => track((async () => {
+// ---------- keep-alive ----------
+// The free backend host sleeps after ~15 minutes without requests, and waking up takes about a minute.
+// While the app is open, ping the health check every 10 s so it stays awake. Quiet: no loading bar,
+// no sign-in needed, errors ignored (the next ping simply tries again).
+export const KEEP_ALIVE_MS = 10_000;
+export function startKeepAlive(ms = KEEP_ALIVE_MS) {
+  const ping = () => fetch(`${API_URL}/api/health`, { cache: 'no-store' }).catch(() => {});
+  ping();
+  const timer = setInterval(ping, ms);
+  return () => clearInterval(timer);
+}
+
+export const importCsv =(projectId, file) => track((async () => {
   const text = await file.text();
   const res = await fetch(`${API_URL}/api/import?project=${projectId}`, {
     method: 'POST', body: text, headers: { Authorization: 'Bearer ' + getToken(), 'Content-Type': 'text/csv' },
