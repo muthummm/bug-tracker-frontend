@@ -10,7 +10,10 @@ export const STATUSES = ['Open', 'In Progress', 'Fixed', 'Ready for Retest', 'Re
 export const PRIORITIES = ['Critical', 'High', 'Medium', 'Low'];
 // Developers can't close or reopen: the tester verifies the fix (same as the backend's src/constants.js)
 export const DEV_STATUSES = ['Open', 'In Progress', 'Fixed', 'Ready for Retest', 'Not a Bug'];
-export const isTester = user => user?.role === 'Tester';
+// Testers and managers have full access (report, edit, close, reopen, manage projects and teams).
+export const isTester = user => user?.role === 'Tester' || user?.role === 'Manager';
+// Bugs are never assigned to managers, so they are left out of every assignee list.
+export const isAssignable = user => user?.role !== 'Manager';
 
 const TOKEN_KEY = 'bugtracker.token';
 export const getToken = () => localStorage.getItem(TOKEN_KEY);

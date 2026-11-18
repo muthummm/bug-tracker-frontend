@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   api, getToken, setToken, downloadCsv, importCsv, STATUSES, DEV_STATUSES, PRIORITIES, STATUS_VAR, PRIORITY_VAR, fmtDate, fmtTime, today,
-  isTester, fileUrl, subscribePending,
+  isTester, isAssignable, fileUrl, subscribePending,
 } from './api.js';
 
 const ROLE_INFO = {
   Tester: 'Report bugs, import sheets, edit bug details, and verify fixes: close or reopen bugs.',
   Developer: 'Work on bugs: move them to In Progress, Fixed, Ready for Retest or Not a Bug, comment and add notes.',
+  Manager: 'Oversee projects with the same access as a tester. Bugs are never assigned to managers.',
 };
 
 // ---------- small pieces ----------
@@ -132,11 +133,11 @@ function AuthScreen({ onAuthed }) {
     <div className="auth">
       <form className="auth-card" onSubmit={submit} aria-busy={busy || undefined}>
         <h1>Bug Log</h1>
-        <p className="muted">{mode === 'login' ? 'Sign in to report and track bugs.' : 'Create an account for a tester or developer.'}</p>
+        <p className="muted">{mode === 'login' ? 'Sign in to report and track bugs.' : 'Create an account for a tester, developer or manager.'}</p>
         {mode === 'register' && (
           <>
             <fieldset className="roles">
-              <legend>Are you a tester or a developer?</legend>
+              <legend>What is your role?</legend>
               {Object.entries(ROLE_INFO).map(([role, info]) => (
                 <label key={role} className="role-card">
                   <input type="radio" name="role" value={role} checked={f.role === role} onChange={set('role')} />
@@ -210,8 +211,9 @@ function BugForm({ bug, project, users, modules, panels, onSaved, onCancel, dirt
     } catch (e2) { setErr(e2.message); setBusy(false); }
   }
 
+  // Managers are never assignees
   const developers = users.filter(u => u.role === 'Developer');
-  const others = users.filter(u => u.role !== 'Developer');
+  const others = users.filter(u => u.role === 'Tester');
 
   return (
     <form onSubmit={submit} noValidate
@@ -293,7 +295,7 @@ const NEXT_STEPS = {
 const waitingText = (status, tester) => tester
   ? (['Open', 'Reopened', 'In Progress'].includes(status) ? 'Waiting for the developer to fix this.' : 'No suggested step.')
   : (['Fixed', 'Ready for Retest'].includes(status) ? 'Waiting for the tester to retest and close it.' : 'This bug is done. A tester can reopen it if needed.');
-function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
+function BugDetail({ id, me, onClose, onEdit, onChanged, onNotificationsChanged, toast }) {
   const [data, setData] = useState(null);
   const [err, setErr] = useState('');
   const [status, setStatus] = useState('');
@@ -310,6 +312,10 @@ function BugDetail({ id, me, onClose, onEdit, onChanged, toast }) {
     } catch (e) { setErr(e.message); }
   }, [id]);
   useEffect(() => { load(); }, [load]);
+  // Opening a bug counts as reading its notifications
+  useEffect(() => {
+    api(`/notifications/read-all?bug=${id}`, { method: 'POST', silent: true }).then(() => onNotificationsChanged?.(), () => {});
+  }, [id, onNotificationsChanged]);
 
   async function updateStatus(target = status, which = 'status:' + target) {
     if (busy) return;
@@ -482,12 +488,12 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
       <div className="dlg-head"><h2 id="team-title">Team · {project.name}</h2>
         <button className="x" onClick={onClose} aria-label="Close">×</button></div>
       <div className="dlg-body">
-        <p className="hint">Only the people listed here can see this project and its bugs.{tester ? ' Add a developer to give them access.' : ''}</p>
+        <p className="hint">Only the people listed here can see this project and its bugs.{tester ? ' Add a developer, tester or manager to give them access.' : ''}</p>
         {tester && (
           <div className="team-add">
             <select id="t-pick" value={pick} onChange={e => setPick(e.target.value)} aria-label="Person to add" disabled={loadingPeople}>
               <option value="">{loadingPeople ? 'Loading people…' : candidates.length ? 'Choose a person to add…' : 'Everyone with an account is already here'}</option>
-              {['Developer', 'Tester'].map(role => {
+              {['Developer', 'Tester', 'Manager'].map(role => {
                 const list = candidates.filter(u => u.role === role);
                 return list.length > 0 && <optgroup key={role} label={role + 's'}>{list.map(u => <option key={u.id} value={u.id}>{u.name} ({u.username})</option>)}</optgroup>;
               })}
@@ -514,7 +520,7 @@ function TeamPanel({ project, me, members, onChanged, onClose, toast }) {
 }
 
 // ---------- project picker ----------
-function ProjectsScreen({ me, onOpen, onLogout, signingOut, toast }) {
+function ProjectsScreen({ me, onOpen, onLogout, signingOut, unread, toast }) {
   const [projects, setProjects] = useState(null);
   const [err, setErr] = useState('');
   const [adding, setAdding] = useState(false);
@@ -547,7 +553,7 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, toast }) {
       <header className="top">
         <div className="wrap">
           <div className="brand"><h1>Bug Log</h1><span className="sub">{me.name} · {me.role}</span></div>
-          <BusyBtn className="btn ghost signout" busy={signingOut} busyText="Signing out…" onClick={onLogout}>Sign out</BusyBtn>
+          <TopRight unread={unread} onLogout={onLogout} signingOut={signingOut} />
         </div>
       </header>
       <main className="wrap projects">
@@ -575,7 +581,7 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, toast }) {
           <div className="empty list">
             {isTester(me)
               ? <><h2>No projects yet</h2><p>Create a project, then add your developers to it from Team.</p></>
-              : <><h2>You haven't been added to a project yet</h2><p>Ask your tester to add <b>{me.username}</b> to a project. It will show up here right after.</p>
+              : <><h2>You haven't been added to a project yet</h2><p>Ask your tester or manager to add <b>{me.username}</b> to a project. It will show up here right after.</p>
                   <BusyBtn className="btn" busy={refreshing} busyText="Checking…" onClick={load}>Check again</BusyBtn></>}
           </div>
         )}
@@ -588,7 +594,7 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, toast }) {
                 <span><b>{p.total}</b> bugs</span>
                 <span style={{ '--c': 'var(--s-open)' }}><span className="dot" /> <b>{p.active || 0}</b> open</span>
                 <span style={{ '--c': 'var(--s-retest)' }}><span className="dot" /> <b>{p.to_verify || 0}</b> to verify</span>
-                {!isTester(me) && <span style={{ '--c': 'var(--accent)' }}><span className="dot" /> <b>{p.mine || 0}</b> assigned to you</span>}
+                {me.role === 'Developer' && <span style={{ '--c': 'var(--accent)' }}><span className="dot" /> <b>{p.mine || 0}</b> assigned to you</span>}
               </span>
               <span className="p-date">{p.members} member{p.members === 1 ? '' : 's'}</span>
               <span className="p-date">{p.last_activity ? 'Updated ' + fmtTime(p.last_activity) : 'No bugs yet'}</span>
@@ -600,20 +606,175 @@ function ProjectsScreen({ me, onOpen, onLogout, signingOut, toast }) {
   );
 }
 
-const hashProject = () => { const m = location.hash.match(/^#project-(\d+)$/); return m ? Number(m[1]) : null; };
+// ---------- notifications ----------
+const NOTIF_POLL_MS = 20000;
+
+// Bell in the top-right corner; the red dot shows how many notifications are unread.
+function Bell({ count, active }) {
+  const label = count ? `Notifications, ${count} unread` : 'Notifications';
+  return (
+    <a className={'btn ghost bell' + (active ? ' active' : '')} href="#notifications" aria-label={label} title={label}
+      aria-current={active ? 'page' : undefined}>
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+      </svg>
+      {count > 0 && <span className="bell-dot">{count > 99 ? '99+' : count}</span>}
+    </a>
+  );
+}
+
+const TopRight = ({ unread, onLogout, signingOut, bellActive }) => (
+  <div className="top-right">
+    <Bell count={unread} active={bellActive} />
+    <BusyBtn className="btn ghost signout" busy={signingOut} busyText="Signing out…" onClick={onLogout}>Sign out</BusyBtn>
+  </div>
+);
+
+const relTime = s => {
+  const sec = Math.round((Date.now() - new Date(s)) / 1000);
+  if (sec < 60) return 'just now';
+  if (sec < 3600) return `${Math.floor(sec / 60)} min ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} h ago`;
+  if (sec < 7 * 86400) return `${Math.floor(sec / 86400)} d ago`;
+  return fmtTime(s);
+};
+
+// "Tom Tester changed BUG-012 from Open to In Progress"
+function NotifText({ n }) {
+  if (n.type === 'added_to_project') {
+    return <span className="n-text"><b>{n.actor_name}</b>{n.actor_role && <span className="role"> ({n.actor_role})</span>} added you to the project <b>{n.project_name || 'a project'}</b></span>;
+  }
+  const key = <b className="mono">{n.bug_key}</b>;
+  const move = n.from_status && n.to_status
+    ? <> from <StatusPill status={n.from_status} /> to <StatusPill status={n.to_status} /></> : null;
+  const what = {
+    reported: <>reported {key}{n.to_status ? <> as <StatusPill status={n.to_status} /></> : null}</>,
+    status: <>changed {key}{move}</>,
+    comment: <>commented on {key}</>,
+    edited: <>edited {key}{move}</>,
+    notes: <>updated the notes on {key}</>,
+  }[n.type] || <>updated {key}</>;
+  return <span className="n-text"><b>{n.actor_name}</b>{n.actor_role && <span className="role"> ({n.actor_role})</span>} {what}</span>;
+}
+
+function NotificationsScreen({ me, unread, onChanged, onLogout, signingOut, toast }) {
+  const [tab, setTab] = useState('all');
+  const [items, setItems] = useState(null);
+  const [err, setErr] = useState('');
+  const [markingAll, setMarkingAll] = useState(false);
+
+  const load = useCallback(({ silent } = {}) =>
+    api('/notifications' + (tab === 'unread' ? '?unread=1' : ''), { silent })
+      .then(d => { setItems(d.notifications); setErr(''); })
+      .catch(e => setErr(e.message)), [tab]);
+  useEffect(() => { setItems(null); load(); }, [load]);
+  // The bell's poll noticed something new: refresh the list quietly
+  const seen = useRef(unread);
+  useEffect(() => { if (unread > seen.current) load({ silent: true }); seen.current = unread; }, [unread, load]);
+  useEffect(() => { document.title = (unread ? `(${unread}) ` : '') + 'Notifications · Bug Log'; }, [unread]);
+
+  async function open(n) {
+    if (!n.read) {
+      setItems(list => list.map(x => (x.id === n.id ? { ...x, read: true } : x)));
+      api(`/notifications/${n.id}/read`, { method: 'PATCH', silent: true }).then(onChanged, () => {});
+    }
+    if (!n.bug_id) { location.hash = `project-${n.project_id}`; return; } // project-level, e.g. "added you to …"
+    if (!n.bug_title) { toast(`${n.bug_key} was deleted.`, 'error'); return; }
+    location.hash = `project-${n.project_id}/bug-${n.bug_id}`;
+  }
+  async function markAll() {
+    setMarkingAll(true);
+    try {
+      await api('/notifications/read-all', { method: 'POST' });
+      setItems(list => (tab === 'unread' ? [] : list.map(x => ({ ...x, read: true }))));
+      onChanged();
+    } catch (e) { toast(e.message, 'error'); }
+    setMarkingAll(false);
+  }
+
+  return (
+    <>
+      <header className="top">
+        <div className="wrap">
+          <a className="btn ghost back" href="#">← Projects</a>
+          <div className="brand"><h1>Notifications</h1><span className="sub">{me.name} · {me.role}</span></div>
+          <TopRight unread={unread} onLogout={onLogout} signingOut={signingOut} bellActive />
+        </div>
+      </header>
+      <main className="wrap notifs">
+        <div className="notifs-head">
+          <div className="tabs" role="group" aria-label="Show">
+            <button className="chip" aria-pressed={tab === 'all'} onClick={() => setTab('all')}>All</button>
+            <button className="chip" aria-pressed={tab === 'unread'} onClick={() => setTab('unread')}>Unread <span className="n">{unread}</span></button>
+          </div>
+          <BusyBtn className="btn" busy={markingAll} disabled={!unread} busyText="Marking…" onClick={markAll}>Mark all as read</BusyBtn>
+        </div>
+        {err && <div className="notice">{err}</div>}
+        <div className="list" aria-busy={items === null || undefined}>
+          {items === null && !err && <Loader text="Loading notifications…" />}
+          {items && items.length === 0 && (
+            <div className="empty">
+              <h2>{tab === 'unread' ? 'You’re all caught up' : 'No notifications yet'}</h2>
+              <p>{me.role === 'Manager'
+                ? 'You’ll hear about every change to bugs in your projects.'
+                : me.role === 'Developer'
+                  ? 'You’ll hear when bugs assigned to you are reported, changed or commented on.'
+                  : 'You’ll hear when bugs you reported or are assigned to are changed or commented on.'}</p>
+            </div>
+          )}
+          {items && items.map(n => (
+            <button key={n.id} className={'notif' + (n.read ? '' : ' unread')} onClick={() => open(n)}>
+              <span className="n-dot" aria-label={n.read ? undefined : 'Unread'} />
+              <span className="n-main">
+                <NotifText n={n} />
+                <small>{!n.bug_id ? 'Open the project to see its bugs'
+                  : `${n.project_name || 'Project'}${n.bug_title ? ` · ${n.bug_title}` : ' · bug deleted'}`}</small>
+                {n.comment && <span className="n-comment">“{n.comment}”</span>}
+              </span>
+              <time dateTime={n.created_at} title={fmtTime(n.created_at)}>{relTime(n.created_at)}</time>
+            </button>
+          ))}
+        </div>
+        <p className="foot">Notifications are kept for 90 days.</p>
+      </main>
+    </>
+  );
+}
+
+// #notifications | #project-3 | #project-3/bug-12 | (empty) = project list
+const parseHash = () => {
+  if (location.hash === '#notifications') return { view: 'notifications' };
+  const m = location.hash.match(/^#project-(\d+)(?:\/bug-(\d+))?$/);
+  return m ? { view: 'project', projectId: Number(m[1]), bugId: m[2] ? Number(m[2]) : null } : { view: 'projects' };
+};
 
 // ---------- main app ----------
 export default function App() {
   const [me, setMe] = useState(null);
   const [checking, setChecking] = useState(!!getToken());
-  const [projectId, setProjectId] = useState(hashProject);
+  const [route, setRoute] = useState(parseHash);
   useEffect(() => {
-    const onHash = () => setProjectId(hashProject());
+    const onHash = () => setRoute(parseHash());
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
   const [toastState, toast] = useToast();
-  const openProject = id => { location.hash = id ? 'project-' + id : ''; setProjectId(id); };
+  const openProject = id => { location.hash = id ? 'project-' + id : ''; };
+
+  // Unread notification count for the bell, refreshed in the background
+  const [unread, setUnread] = useState(0);
+  const refreshUnread = useCallback(() => {
+    if (!getToken()) return;
+    api('/notifications/unread-count', { silent: true }).then(d => setUnread(d.unread)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!me) { setUnread(0); return; }
+    refreshUnread();
+    const t = setInterval(() => { if (!document.hidden) refreshUnread(); }, NOTIF_POLL_MS);
+    const onVisible = () => { if (!document.hidden) refreshUnread(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVisible); };
+  }, [me, refreshUnread]);
   const [signingOut, setSigningOut] = useState(false);
   const logout = async () => {
     if (signingOut) return;
@@ -637,14 +798,18 @@ export default function App() {
       <TopProgress />
       {checking ? <Loader full text="Checking your sign-in…" />
         : !me ? <AuthScreen onAuthed={onAuthed} />
-        : !projectId ? <ProjectsScreen me={me} onOpen={openProject} onLogout={logout} signingOut={signingOut} toast={toast} />
-        : <BugPage key={projectId} me={me} projectId={projectId} toast={toast} onBack={() => openProject(null)} onLogout={logout} signingOut={signingOut} onSignedOut={signedOut} />}
+        : route.view === 'notifications'
+          ? <NotificationsScreen me={me} unread={unread} onChanged={refreshUnread} onLogout={logout} signingOut={signingOut} toast={toast} />
+        : route.view === 'projects'
+          ? <ProjectsScreen me={me} onOpen={openProject} onLogout={logout} signingOut={signingOut} unread={unread} toast={toast} />
+        : <BugPage key={route.projectId} me={me} projectId={route.projectId} bugId={route.bugId} toast={toast} unread={unread}
+            onNotificationsChanged={refreshUnread} onBack={() => openProject(null)} onLogout={logout} signingOut={signingOut} onSignedOut={signedOut} />}
       <Toast toast={toastState} />
     </>
   );
 }
 
-function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toast }) {
+function BugPage({ me, projectId, bugId, unread, onNotificationsChanged, onBack, onLogout, signingOut, onSignedOut, toast }) {
   const [project, setProject] = useState(null);
   const [panels, setPanels] = useState([]);
   const [bugs, setBugs] = useState([]);
@@ -653,7 +818,9 @@ function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toa
   const [loadErr, setLoadErr] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [filters, setFilters] = useState({ status: '', priority: '', assignee: '', panel: '', q: '', sort: 'new' });
-  const [viewId, setViewId] = useState(null);
+  // The open bug lives in the URL (#project-3/bug-12), so notifications can link to it and Back closes it
+  const viewId = bugId ?? null;
+  const setViewId = id => { location.hash = id ? `project-${projectId}/bug-${id}` : `project-${projectId}`; };
   const [form, setForm] = useState(null); // null | {bug?}
   const fileRef = useRef();
   const formDirty = useRef(false);
@@ -742,8 +909,8 @@ function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toa
             </>}
             <BusyBtn className="btn" busy={exporting} disabled={!project} busyText="Exporting…" onClick={onExport}>Export CSV</BusyBtn>
             {isTester(me) && <button className="btn primary" disabled={!project} onClick={() => setForm({})}>+ Report bug</button>}
-            <BusyBtn className="btn ghost signout" busy={signingOut} busyText="Signing out…" onClick={logout}>Sign out</BusyBtn>
           </div>
+          <TopRight unread={unread} onLogout={logout} signingOut={signingOut} />
         </div>
       </header>
 
@@ -761,8 +928,8 @@ function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toa
 
         <div className="filters">
           <input id="q" type="search" placeholder="Search ID (BUG-012), module, description…" value={filters.q} onChange={setFilter('q')} aria-label="Search bugs" />
-          <button className="chip mine" aria-pressed={mine}
-            onClick={() => setFilters(f => ({ ...f, assignee: mine ? '' : String(me.id) }))}>Assigned to me</button>
+          {isAssignable(me) && <button className="chip mine" aria-pressed={mine}
+            onClick={() => setFilters(f => ({ ...f, assignee: mine ? '' : String(me.id) }))}>Assigned to me</button>}
           {panels.length > 0 && (
             <select id="f-panel" value={filters.panel} onChange={setFilter('panel')} aria-label="Panel">
               <option value="">All panels</option>{panels.map(p => <option key={p}>{p}</option>)}
@@ -773,7 +940,7 @@ function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toa
           </select>
           <select id="f-asg" value={filters.assignee} onChange={setFilter('assignee')} aria-label="Assignee">
             <option value="">All assignees</option><option value="none">Unassigned</option>
-            {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+            {users.filter(isAssignable).map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
           </select>
           <select id="f-sort" value={filters.sort} onChange={setFilter('sort')} aria-label="Sort">
             <option value="new">Newest first</option><option value="old">Oldest first</option>
@@ -819,6 +986,7 @@ function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toa
 
       <Modal open={viewId != null} onClose={() => setViewId(null)} className="sheet" labelledBy="view-title">
         <BugDetail id={viewId} me={me} toast={toast} onClose={() => setViewId(null)} onChanged={() => loadBugs()}
+          onNotificationsChanged={onNotificationsChanged}
           onEdit={bug => { setViewId(null); setForm({ bug }); }} />
       </Modal>
 
@@ -830,7 +998,13 @@ function BugPage({ me, projectId, onBack, onLogout, signingOut, onSignedOut, toa
       <Modal open={form != null} onClose={() => setForm(null)} className="form" labelledBy="form-title" canClose={canCloseForm}>
         <BugForm bug={form?.bug} project={project} users={users} modules={modules} panels={panels} dirtyRef={formDirty}
           onCancel={() => { if (canCloseForm()) setForm(null); }}
-          onSaved={(bug, created) => { toast(created ? `${bug.key} reported successfully` : `${bug.key} updated successfully`); setForm(null); loadBugs(); setViewId(bug.id); }} />
+          onSaved={(bug, created) => {
+            toast(created ? `${bug.key} reported successfully` : `${bug.key} updated successfully`);
+            setForm(null); setViewId(bug.id);
+            // A new bug should always be visible in the list, so drop any filters or search.
+            // Changing the filters reloads the list by itself; otherwise reload it here.
+            if (created && filtered) clearFilters(); else loadBugs();
+          }} />
       </Modal>
     </>
   );
